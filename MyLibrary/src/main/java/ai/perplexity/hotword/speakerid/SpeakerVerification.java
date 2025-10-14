@@ -17,18 +17,22 @@ public final class SpeakerVerification {
 
     // -------- Factories --------
 
-    /** Build from raw audio buffers (2s PCM16LE mono @16kHz each). */
+    // SpeakerVerification.java
+
     public static Verifier createVerifierFromAudio(SpeakerIdApi api, List<byte[]> buffers) throws Exception {
         Objects.requireNonNull(api, "SpeakerIdApi is required");
         if (buffers == null || buffers.isEmpty()) throw new IllegalArgumentException("buffers must not be empty");
         ArrayList<float[]> embs = new ArrayList<>(buffers.size());
         for (byte[] b : buffers) {
-            short[] oneSec = last1sPcm16le(b);
-            embs.add(api.embedOnce(oneSec)); // L2 unit
+            short[] oneSecVoiced = api.extractLast1sVoiced(b);   // <-- USE VAD
+            embs.add(api.embedOnce(oneSecVoiced));               // L2 unit
         }
         float[][] cluster = toMatrix(embs);
-        float[] mean = meanOfRows(cluster); l2(mean);
-        return new Verifier(api, cluster, mean);
+        float[] mean = meanOfRows(cluster); 
+        l2(mean);
+        embs.add(mean);
+        cluster = toMatrix(embs);
+        return new Verifier(api, cluster);
     }
 
     /** Build from a cluster blob previously returned by Verifier.getCluster(). */
