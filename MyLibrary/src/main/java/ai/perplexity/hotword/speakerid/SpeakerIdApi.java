@@ -638,15 +638,6 @@ public final class SpeakerIdApi implements AutoCloseable {
         }
     }
 
-    // ---------- tiny ShortArray ----------
-    private static final class ShortArray {
-        short[] a = new short[0]; int n = 0;
-        void clear(){ n=0; }
-        void append(short[] b){ ensure(n+b.length); System.arraycopy(b,0,a,n,b.length); n+=b.length; }
-        short[] toArray(){ return java.util.Arrays.copyOf(a,n); }
-        private void ensure(int m){ if(a.length>=m)return; a=java.util.Arrays.copyOf(a, Math.max(m,a.length*2+1024)); }
-    }
-
     // ==================== EXTERNAL-AUDIO CLUSTER API (KWD-style) ====================
 
     /** In-memory handle for a cluster managed via external raw audio buffers. */
@@ -711,6 +702,94 @@ public final class SpeakerIdApi implements AutoCloseable {
 
         extClusters.put(id, cm);
         return id;
+    }
+
+    // SpeakerIdApi.java
+
+    /** Extract exactly the last 1.0 s of VAD-passing audio from pcm.
+     * Policy:
+     *  - Split into vadChunk frames
+     *  - Keep ONLY frames where vad.feed(frame) >= 0.1
+     *  - If total kept >= 1.0 s → return the LAST 1.0 s
+     *  - If total kept == 0    → return 1.0 s of zeros
+     *  - Else (0 < kept < 1.0 s) → DUPLICATE the kept sequence to reach 1.0 s
+     */
+    public short[] extractLast1sVoiced(short[] pcm) {
+        final int rate = cfg.rateHz;              // e.g. 16000
+        final int vadChunk = cfg.vadChunk;        // frame size used by VAD
+        final int want = (int)Math.round(1.0f * rate);
+        final float thr = 0.10f;                  // fixed threshold per your request
+
+        if (pcm == null || pcm.length == 0) return new short[want];
+
+        ShortArray voiced = new ShortArray();
+
+        int i = 0;
+        while (i < pcm.length) {
+            int take = Math.min(vadChunk, pcm.length - i);
+            short[] b = java.util.Arrays.copyOfRange(pcm, i, i + take);
+            i += take;
+
+            // pad to vadChunk before VAD
+            if (b.length < vadChunk) {
+                short[] pad = new short[vadChunk];
+                System.arraycopy(b, 0, pad, 0, b.length);
+                b = pad;
+            }
+
+            float p = vad.feed(b);
+            if (p >= thr) {
+                // keep ONLY voiced frames
+                voiced.append(b);
+            }
+            // else: drop non-voiced completely
+        }
+
+        short[] allVoiced = voiced.toArray();
+
+        if (allVoiced.length >= want) {
+            // return the LAST 1.0 s
+            short[] y = new short[want];
+            System.arraycopy(allVoiced, allVoiced.length - want, y, 0, want);
+            return y;
+        }
+
+        if (allVoiced.length == 0) {
+            // nothing voiced → zeros
+            return new short[want];
+        }
+
+        // DUPLICATE the voiced sequence to fill to 1.0 s
+        short[] y = new short[want];
+        int off = 0;
+        while (off < want) {
+            int copy = Math.min(allVoiced.length, want - off);
+            System.arraycopy(allVoiced, 0, y, off, copy);
+            off += copy;
+        }
+        return y;
+    }
+
+    /** Optional convenience if RN sends PCM16LE bytes. */
+    public short[] extractLast1sVoiced(byte[] pcm16le) {
+        final int want = (int)Math.round(1.0f * cfg.rateHz);
+        if (pcm16le == null) return new short[want];
+        int smp = pcm16le.length / 2;
+        short[] x = new short[smp];
+        for (int i=0, s=0; i+1<pcm16le.length; i+=2, s++) {
+            int lo = (pcm16le[i] & 0xFF);
+            int hi = (pcm16le[i+1] << 8);
+            x[s] = (short)(hi | lo);
+        }
+        return extractLast1sVoiced(x);
+    }
+
+    private static final class ShortArray {
+        short[] a = new short[0]; int n = 0;
+        void append(short[] b){ ensure(n+b.length); System.arraycopy(b,0,a,n,b.length); n+=b.length; }
+        short[] toArray(){ return java.util.Arrays.copyOf(a, n); }
+        void clear(){ n = 0; }  // <-- added: used by voiced.clear() / out.clear()
+        private void ensure(int m){ if(a.length>=m) return; a = java.util.Arrays.copyOf(a, Math.max(m, a.length*2+1024)); }
     }
 
     /**
