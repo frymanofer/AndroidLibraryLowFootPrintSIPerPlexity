@@ -113,6 +113,7 @@ public final class SpeakerEmbedderOrt implements AutoCloseable {
 
         if (expectsFeatures) {
             this.fbank = new Fbank(new Fbank.Config(this.sampleRate));
+
             Log.i(TAG, "Speakernet expects features. dataInput=" + dataInputName +
                     " shape=" + Arrays.toString(dataInputShape) +
                     (melAtDim1 ? " layout=[B,64,T]" : " layout=[B,T,64]") +
@@ -274,34 +275,35 @@ public final class SpeakerEmbedderOrt implements AutoCloseable {
 
     // ---------------------- Output selection (robust) ----------------------
 
-    /**
-     * Choose the embedding tensor from the result:
-     *   - Prefer FLOAT rank-2 [B,D] or rank-1 [D] with 64 <= D <= 1024 (closest to 256 wins).
-     *   - Accept rank-3 [B,T,D] in same D range (mean over T).
-     *   - Ignore big-class logits like [B,7205].
-     */
     private float[] pickEmbeddingOutput(OrtSession.Result out) {
-        float[] best = new float[0];
-        int bestScore = Integer.MAX_VALUE; // distance from 256 (lower is better)
-
-        // Use cached output names — no OrtException here
+        // 1) Prefer names that look like embeddings
+        String[] prefer = new String[]{"embs", "emb", "spk", "speaker"};
         for (int i = 0; i < outputNames.size(); i++) {
-            OnnxValue v = out.get(i);
-            float[] cand = extractAsVector(v);
-            if (cand.length == 0) continue;
+            String name = outputNames.get(i).toLowerCase(Locale.ROOT);
+            boolean looksLikeEmb = false;
+            for (String p : prefer) { if (name.contains(p)) { looksLikeEmb = true; break; } }
+            if (!looksLikeEmb) continue;
 
-            int D = cand.length;
-            if (D < 64 || D > 1024) continue; // filter out logits or tiny scalars
-
-            int score = Math.abs(D - 256);
-            if (score < bestScore) {
-                best = cand;
-                bestScore = score;
+            float[] cand = extractAsVector(out.get(i));
+            if (cand.length >= 64 && cand.length <= 1024) {
+                Log.d(TAG, "pickEmbeddingOutput: preferred by name '" + outputNames.get(i) + "', D=" + cand.length);
+                return cand;
             }
         }
 
+        // 2) Fallback: pick vector whose D is closest to 256 (as before)
+        float[] best = new float[0];
+        int bestScore = Integer.MAX_VALUE;
+        for (int i = 0; i < outputNames.size(); i++) {
+            float[] cand = extractAsVector(out.get(i));
+            if (cand.length == 0) continue;
+            int D = cand.length;
+            if (D < 64 || D > 1024) continue;
+            int score = Math.abs(D - 256);
+            if (score < bestScore) { best = cand; bestScore = score; }
+        }
+
         if (best.length == 0) {
-            // Fallback: try first output as before (compatibility)
             best = extractAsVector(out.get(0));
             if (best.length != 0) {
                 Log.w(TAG, "pickEmbeddingOutput: fell back to output[0] length=" + best.length);
@@ -309,7 +311,7 @@ public final class SpeakerEmbedderOrt implements AutoCloseable {
                 Log.e(TAG, "pickEmbeddingOutput: no usable float output found");
             }
         } else {
-            Log.d(TAG, "pickEmbeddingOutput: chose vector length " + best.length + " (closest to 256)");
+            Log.d(TAG, "pickEmbeddingOutput: chose by D~256, length=" + best.length);
         }
         return best;
     }

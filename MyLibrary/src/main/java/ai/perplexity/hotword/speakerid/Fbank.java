@@ -15,6 +15,7 @@ final class Fbank {
         final boolean useLog;     // true
         final boolean snipEdges;  // true (Kaldi/Sherpa default)
         final float dither;       // 0.0 (deterministic)
+        final boolean doCmn;      // <-- NEW: default false to match Python speaker pipeline
 
         Config(int sr) {
             this.sampleRate = sr;
@@ -27,6 +28,7 @@ final class Fbank {
             this.useLog     = true;
             this.snipEdges  = true;
             this.dither     = 0f;
+            this.doCmn      = false; // <-- default OFF for speaker models
         }
     }
 
@@ -41,7 +43,7 @@ final class Fbank {
         this.melFilters = buildMelTriFilters(c);
     }
 
-    /** Main entry: short[] pcm16 → [T, nMels] features (log Mel), with per-bin mean norm (CMN). */
+    /** Main entry: short[] pcm16 → [T, nMels] features (log Mel), optional per-bin mean norm (CMN). */
     float[][] compute(short[] pcm) {
         if (pcm == null || pcm.length == 0) return new float[0][0];
 
@@ -70,11 +72,10 @@ final class Fbank {
 
         for (int t = 0; t < T; t++) {
             int start = t * cfg.frameShift;
-            // center frame if !snipEdges; we keep snipEdges=true → simple start index
-            // Copy frame with window
             Arrays.fill(re, 0f);
             Arrays.fill(im, 0f);
 
+            // Windowed frame
             for (int i = 0; i < cfg.frameLen; i++) {
                 int idx = start + i;
                 float s = 0f;
@@ -97,19 +98,13 @@ final class Fbank {
             for (int mIx = 0; mIx < cfg.nMels; mIx++) {
                 float e = 0f;
                 float[] w = melFilters[mIx];
-                for (int k = 0; k < w.length; k++) {
-                    e += w[k] * pow[k];
-                }
-                if (cfg.useLog) {
-                    m[mIx] = (e > 1e-10f) ? (float)Math.log(e) : logFloor;
-                } else {
-                    m[mIx] = e;
-                }
+                for (int k = 0; k < w.length; k++) e += w[k] * pow[k];
+                m[mIx] = cfg.useLog ? ((e > 1e-10f) ? (float)Math.log(e) : logFloor) : e;
             }
         }
 
-        // Per-bin CMN (subtract mean over time), like common speaker pipelines
-        cmnInPlace(feats);
+        // Optional per-bin CMN (speaker pipeline: OFF by default)
+        if (cfg.doCmn) cmnInPlace(feats);
 
         return feats;
     }
@@ -125,7 +120,7 @@ final class Fbank {
     }
 
     private static double hzToMel(double f) {
-        // Slaney mel (HTK alternative is fine too; Slaney is what Kaldi/kaldifeat uses)
+        // Slaney mel (HTK also common; Slaney matches Kaldi/kaldifeat)
         return 2595.0 * Math.log10(1.0 + f / 700.0);
     }
     private static double melToHz(double m) {

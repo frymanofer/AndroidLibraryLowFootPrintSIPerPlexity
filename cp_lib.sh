@@ -7,3 +7,4 @@
 # cp MyLibrary/build/outputs/aar/MyLibrary-release.aar ../porcuSafe/android/app/libs/MyLibrary-release.aar
 
 cp MyLibrary/build/outputs/aar/MyLibrary-release.aar ../android-hotword/android_perplexity/libs/ai/perplexity/hotword/speakerid/1.0.0/sid-1.0.0.aar
+cp MyLibrary/build/outputs/aar/MyLibrary-release.aar ../android-hotword/SidTest/app/libs/sid-1.0.0.aar

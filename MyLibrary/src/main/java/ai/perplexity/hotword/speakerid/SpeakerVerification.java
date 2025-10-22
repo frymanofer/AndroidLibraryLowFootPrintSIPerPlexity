@@ -16,26 +16,62 @@ public final class SpeakerVerification {
     public static void setDefaultApi(SpeakerIdApi api) { defaultApi = api; }
 
     // -------- Factories --------
+/** Duplicate-pad x until it reaches want samples (deterministic). */
+private static short[] padByDup(short[] x, int want) {
+    if (x == null || x.length == 0) return new short[want];
+    if (x.length >= want) return java.util.Arrays.copyOf(x, want);
+    short[] y = new short[want];
+    int k = 0;
+    while (k < want) {
+        int take = Math.min(x.length, want - k);
+        System.arraycopy(x, 0, y, k, take);
+        k += take;
+    }
+    return y;
+}
 
-    public static Verifier createVerifierFromAudio(SpeakerIdApi api, List<byte[]> buffers) throws Exception {
-        Objects.requireNonNull(api, "SpeakerIdApi is required");
-        if (buffers == null || buffers.isEmpty()) throw new IllegalArgumentException("buffers must not be empty");
+public static Verifier createVerifierFromAudio(SpeakerIdApi api, List<byte[]> buffers) throws Exception {
+    Objects.requireNonNull(api, "SpeakerIdApi is required");
+    if (buffers == null || buffers.isEmpty())
+        throw new IllegalArgumentException("buffers must not be empty");
 
-        ArrayList<float[]> embs = new ArrayList<>(buffers.size());
-        for (byte[] b : buffers) {
-            short[] oneSecVoiced = api.extractLast1sVoiced(b);   // <-- USE VAD
-            embs.add(api.embedOnce(oneSecVoiced));               // L2 unit
+    final int rate = RATE_HZ;
+    final int win = rate;   // 1.0s
+    final int hop = rate;   // 1.0s
+
+    ArrayList<float[]> embs = new ArrayList<>();
+
+    for (byte[] b : buffers) {
+        // Tail-first, VAD-only voiced from last tailSec (matches Python --tail-sec path in SpeakerIdApi)
+        short[] voiced = api.extractLast1sVoiced(b);
+
+        // Base 1.0s slices (win=hop=1.0s)
+        for (int i = 0; i + win <= voiced.length; i += hop) {
+            short[] sl = java.util.Arrays.copyOfRange(voiced, i, i + win);
+            embs.add(api.embedOnce(sl)); // already L2-normalized
         }
 
-        // Optionally append L2-mean inside the cluster (as last row)
-        float[][] cluster = toMatrix(embs);
-        float[] mean = meanOfRows(cluster);
-        l2(mean);
-        embs.add(mean);
-        cluster = toMatrix(embs); // cluster WITH mean appended as last row
-
-        return new Verifier(api, cluster);
+        // Tail remainder → pad by duplication to 1.0s and embed
+        int rem = voiced.length % hop;
+        if (rem > 0) {
+            short[] tail = java.util.Arrays.copyOfRange(voiced, voiced.length - rem, voiced.length);
+            short[] pad1s = padByDup(tail, win);
+            embs.add(api.embedOnce(pad1s));
+        }
     }
+
+    // Make the cluster from all rows
+    float[][] cluster = toMatrix(embs);
+
+    // Append L2-mean row as last row (Python targets are {mean + rows})
+    float[] mean = meanOfRows(cluster);
+    l2(mean);
+    embs.add(mean);
+    cluster = toMatrix(embs);
+
+    return new Verifier(api, cluster);
+}
+
 
     /** Build from a cluster blob previously returned by Verifier.getCluster() (v2: cluster-only). */
     public static Verifier createVerifierFromCluster(byte[] blob) throws IOException {
@@ -47,7 +83,7 @@ public final class SpeakerVerification {
 
     public static final class Verifier {
         private SpeakerIdApi api;          // optional; if null, uses defaultApi
-        private final float[][] cluster;   // K x D (rows are L2-unit). May include a mean row if you appended it.
+        private final float[][] cluster;   // K x D (rows are L2-unit). Last row may be mean.
 
         private Verifier(SpeakerIdApi api, float[][] cluster) {
             this.api = api;
@@ -57,19 +93,55 @@ public final class SpeakerVerification {
         /** Optional: bind/override the API later (e.g., after restore). */
         public void bind(SpeakerIdApi api) { this.api = api; }
 
-        /** Score new sample (2s PCM16LE mono @16kHz recommended; we use VAD last 1s). */
+/** Cap to capSec seconds and ensure at least minSec seconds by duplication padding. */
+private static short[] capFloorWhole(short[] x, float capSec, float minSec, int rate) {
+    if (x == null) x = new short[0];
+    int cap = Math.max(1, Math.round(capSec * rate));
+    int min = Math.max(1, Math.round(minSec * rate));
+    short[] y = java.util.Arrays.copyOf(x, Math.min(x.length, cap));
+    return (y.length >= min) ? y : padByDup(y, min);
+}
+
         public float verify(byte[] pcm16le) {
             try {
                 SpeakerIdApi use = (api != null) ? api : defaultApi;
-                if (use == null) throw new IllegalStateException("No embedder available. Call SpeakerVerification.setDefaultApi(...) or bind(...) first.");
+                if (use == null) throw new IllegalStateException("No embedder available.");
 
-                short[] oneSecVoiced = use.extractLast1sVoiced(pcm16le);
-                float[] q = use.embedOnce(oneSecVoiced); // L2-unit
+                final int rate = RATE_HZ;
+                final int win = rate;   // 1.0s
+                final int hop = rate;   // 1.0s
 
+                // Tail-first, VAD-only voiced from last tailSec (matches Python)
+                short[] voiced = use.extractLast1sVoiced(pcm16le);
+
+                // Build query set (FLEX-lite): 1.0s base slices + tail remainder padded to 1.0s + "whole" capped to 1.5s, floored to 0.25s
+                ArrayList<float[]> queries = new ArrayList<>();
+
+                // 1.0s slices
+                for (int i = 0; i + win <= voiced.length; i += hop) {
+                    short[] sl = java.util.Arrays.copyOfRange(voiced, i, i + win);
+                    queries.add(use.embedOnce(sl)); // L2 unit
+                }
+
+                // remainder padded to 1.0s
+                int rem = voiced.length % hop;
+                if (rem > 0) {
+                    short[] tail = java.util.Arrays.copyOfRange(voiced, voiced.length - rem, voiced.length);
+                    short[] pad1s = padByDup(tail, win);
+                    queries.add(use.embedOnce(pad1s));
+                }
+
+                // "whole" strategy: cap to 1.5s, floor at 0.25s (pad by duplication)
+                short[] whole = capFloorWhole(voiced, /*capSec=*/1.5f, /*minSec=*/0.25f, rate);
+                queries.add(use.embedOnce(whole));
+
+                // Best-of scoring: max over (queries x cluster rows)
                 float best = Float.NEGATIVE_INFINITY;
-                for (float[] row : cluster) {
-                    float s = cos(q, row);
-                    if (s > best) best = s;
+                for (float[] q : queries) {
+                    for (float[] row : cluster) {
+                        float s = cos(q, row);
+                        if (s > best) best = s;
+                    }
                 }
                 return best;
             } catch (Throwable t) {
@@ -122,27 +194,18 @@ public final class SpeakerVerification {
     }
 
     // -------- Audio + math helpers --------
-    private static short[] last1sPcm16le(byte[] le16) {
-        if (le16 == null) return new short[RATE_HZ];
-        int smp = le16.length / 2;
-        short[] pcm = new short[smp];
-        for (int i = 0, s = 0; i + 1 < le16.length; i += 2, s++) {
-            int lo = (le16[i] & 0xFF);
-            int hi = (le16[i + 1] << 8);
-            pcm[s] = (short) (hi | lo);
-        }
-        return last1sPcm16(pcm);
-    }
 
-    private static short[] last1sPcm16(short[] pcm) {
-        int want = RATE_HZ;
-        if (pcm.length >= want) { short[] y = new short[want]; System.arraycopy(pcm, pcm.length - want, y, 0, want); return y; }
-        if (pcm.length <= 0) return new short[want];
+    /** Force to EXACTLY 1.0s @16k by duplication or trimming (deterministic). */
+    private static short[] toExactly1s(short[] x) {
+        final int want = RATE_HZ;
+        if (x == null || x.length == 0) return new short[want];
+        if (x.length == want) return x;
+        if (x.length > want) return Arrays.copyOfRange(x, x.length - want, x.length); // keep last 1s
         short[] y = new short[want];
         int i = 0;
         while (i < want) {
-            int take = Math.min(pcm.length, want - i);
-            System.arraycopy(pcm, 0, y, i, take);
+            int take = Math.min(x.length, want - i);
+            System.arraycopy(x, 0, y, i, take);
             i += take;
         }
         return y;

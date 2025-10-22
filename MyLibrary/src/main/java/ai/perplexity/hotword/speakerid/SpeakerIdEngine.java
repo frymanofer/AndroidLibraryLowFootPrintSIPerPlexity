@@ -220,6 +220,7 @@ public final class SpeakerIdEngine implements AutoCloseable {
         while (i < pcm16.length) {
             int take = Math.min(vadChunk, pcm16.length - i);
             short[] block = Arrays.copyOfRange(pcm16, i, i + take);
+            int origLen = block.length;                  // remember
             i += take;
 
             if (block.length < vadChunk) {
@@ -229,21 +230,25 @@ public final class SpeakerIdEngine implements AutoCloseable {
 
             if (state == State.IDLE) {
                 // preroll queue
-                preroll.addLast(block);
+                short[] unpadded = (origLen == vadChunk) ? block : Arrays.copyOf(block, origLen);
+
+                preroll.addLast(unpadded);
                 while (preroll.size() > cfg.prerollFrames) preroll.removeFirst();
                 if (p >= cfg.onThr) {
                     state = State.ACTIVE;
                     // prepend preroll to both full & voiced
                     concatDequeInto(full, preroll);
                     concatDequeInto(voiced, preroll);
-                    full.append(block);
-                    voiced.append(block);
+                    full.append(unpadded);
+                    voiced.append(unpadded);
                     accumulatedSilence = 0;
                 }
             } else {
-                full.append(block);
+                short[] unpadded = (origLen == vadChunk) ? block : Arrays.copyOf(block, origLen);
+
+                full.append(unpadded);
                 if (p >= cfg.offThr) {
-                    voiced.append(block);
+                    voiced.append(unpadded);
                     accumulatedSilence = 0;
                 } else {
                     accumulatedSilence += vadChunk;

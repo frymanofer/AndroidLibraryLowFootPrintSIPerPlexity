@@ -5,18 +5,23 @@ import java.util.Arrays;
 
 public final class SpeakerIdConfigWWD {
     public int   rateHz            = 16000;
-    public int   vadChunk          = 1280;  // 80ms at 16k
-    public float onThr             = 0.45f;
-    public float offThr            = 0.30f;
-    public float silenceAfterSec   = 2.0f;
-    public int   prerollFrames     = 2;
-    // SpeakerIdConfig.java  (add fields with sensible defaults)
-    public float  onboardVoicedTargetSec = 3.0f; // need this much voiced audio in ONE segment
-    public boolean debugVadFrames = true;       // spammy logs per VAD frame
+    public int   vadChunk          = 1280;     // 80ms @ 16k  (python --vad-chunk 1280)
+    public float onThr             = 0.50f;    // python --on 0.5
+    public float offThr            = onThr / 10.0f;    // used only by state-machine segmentation
+    public float silenceAfterSec   = 2.0f;     // used only by state-machine segmentation
+    public int   prerollFrames     = 0;        // strict parity: do not include pre-activation frames
 
+    /** Use ONLY the last tailSec seconds BEFORE VAD selection (python --tail-sec). */
+    public float tailSec           = 1.5f;     // python --tail-sec 1.5
+
+    // This is only used by the state-machine onboarding path (mic); the collect-voiced path ignores it.
+    public float  onboardVoicedTargetSec = 3.0f;
+    public boolean debugVadFrames = true;
+
+    // Slice/min settings used by some engine strategies; python default min_embed_sec=0.25
     public float sliceSec          = 1.0f;
     public Float sliceHopSec       = 1.0f;
-    public float minEmbedSec       = 1.0f;
+    public float minEmbedSec       = 0.25f;    // python default
 
     public boolean flexEnabled     = false;
     public float[] flexSizesSec    = new float[]{0.25f, 0.50f, 0.75f, 1.00f};
@@ -37,6 +42,9 @@ public final class SpeakerIdConfigWWD {
         SpeakerIdConfig c = new SpeakerIdConfig();
         c.rateHz = rateHz; c.vadChunk = vadChunk; c.onThr = onThr; c.offThr = offThr;
         c.silenceAfterSec = silenceAfterSec; c.prerollFrames = prerollFrames;
+
+        c.tailSec = tailSec;                 // <— add this to SpeakerIdConfig
+
         c.sliceSec = sliceSec; c.sliceHopSec = sliceHopSec; c.minEmbedSec = minEmbedSec;
         c.flexEnabled = flexEnabled; c.flexSizesSec = Arrays.copyOf(flexSizesSec, flexSizesSec.length);
         c.flexMaxSec = flexMaxSec; c.flexTopK = flexTopK;

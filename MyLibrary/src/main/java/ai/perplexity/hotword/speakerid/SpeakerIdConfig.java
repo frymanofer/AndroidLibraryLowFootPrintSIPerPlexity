@@ -13,6 +13,7 @@ public final class SpeakerIdConfig {
     // SpeakerIdConfig.java  (add fields with sensible defaults)
     public float  onboardVoicedTargetSec = 3.0f; // need this much voiced audio in ONE segment
     public boolean debugVadFrames = true;       // spammy logs per VAD frame
+    public float tailSec = 1.5f;  // python --tail-sec default
 
     public float sliceSec          = 0.50f;
     public Float sliceHopSec       = null;  // null -> hop=slice

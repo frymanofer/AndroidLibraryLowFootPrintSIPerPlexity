@@ -150,6 +150,21 @@ public final class SpeakerIdApi implements AutoCloseable {
         return SpeakerIdStorage.hasDefaultTargets(ctx);
     }
 
+        // SpeakerIdApi.java — add this convenience:
+    public VerificationResult verifyTailFlex(byte[] pcm16le) throws Exception {
+        short[] voiced = extractLast1sVoiced(pcm16le);  // tail-first, VAD-only (like --tail-sec)
+        return engine.verifyFromVoicedSegment(voiced);  // FLEX best-of (same as Python)
+    }
+
+    public VerificationResult verifyBytesFlex(byte[] pcm16le) throws Exception {
+        // exact same preprocessing as your simple verifier, but delegate to engine FLEX
+        short[] voiced = extractLast1sVoiced(pcm16le); // tail-first, VAD-only, variable length
+        if (voiced == null || voiced.length == 0) {
+            return new VerificationResult(0f, 0f, Float.NEGATIVE_INFINITY, "none", "none", java.util.Collections.emptyMap());
+        }
+        return engine.verifyFromVoicedSegment(voiced); // uses FLEX + {mean + cluster}
+    }
+
     /** Use explicit mean/cluster files for verification; returns success flag. */
     public boolean initVerificationWithFiles(File meanNpy, File clusterNpy) {
         try {
@@ -706,74 +721,49 @@ public final class SpeakerIdApi implements AutoCloseable {
 
     // SpeakerIdApi.java
 
-    /** Extract exactly the last 1.0 s of VAD-passing audio from pcm.
-     * Policy:
-     *  - Split into vadChunk frames
-     *  - Keep ONLY frames where vad.feed(frame) >= 0.1
-     *  - If total kept >= 1.0 s → return the LAST 1.0 s
-     *  - If total kept == 0    → return 1.0 s of zeros
-     *  - Else (0 < kept < 1.0 s) → DUPLICATE the kept sequence to reach 1.0 s
-     */
+    /** Extract exactly the last 1.0 s of VAD-passing audio from pcm. **/
     public short[] extractLast1sVoiced(short[] pcm) {
-        final int rate = cfg.rateHz;              // e.g. 16000
-        final int vadChunk = cfg.vadChunk;        // frame size used by VAD
-        final int want = (int)Math.round(1.0f * rate);
-        final float thr = 0.10f;                  // fixed threshold per your request
+        // NOTE: name kept for API compatibility; now returns ALL voiced from LAST tailSec (no 1s forcing).
+        final int rate     = cfg.rateHz;          // 16000
+        final int vadChunk = cfg.vadChunk;        // 1280
+        final float thr    = cfg.onThr;           // 0.5 (python --on 0.5)
+        final int tailSamp = (int)Math.round(cfg.tailSec * rate); // python --tail-sec 1.5
 
-        if (pcm == null || pcm.length == 0) return new short[want];
+        if (pcm == null || pcm.length == 0) return new short[0];
+
+        // Cut to last tailSec seconds (like python tail_last_sec_i16)
+        int start = Math.max(0, pcm.length - tailSamp);
+        int end   = pcm.length;
 
         ShortArray voiced = new ShortArray();
 
-        int i = 0;
-        while (i < pcm.length) {
-            int take = Math.min(vadChunk, pcm.length - i);
-            short[] b = java.util.Arrays.copyOfRange(pcm, i, i + take);
+        int i = start;
+        while (i < end) {
+            int take = Math.min(vadChunk, end - i);
+            short[] block = java.util.Arrays.copyOfRange(pcm, i, i + take);
+            int origLen = block.length;         // remember pre-pad size
             i += take;
 
-            // pad to vadChunk before VAD
-            if (b.length < vadChunk) {
+            // Pad only for VAD inference, but NEVER append the padded tail to voiced
+            if (origLen < vadChunk) {
                 short[] pad = new short[vadChunk];
-                System.arraycopy(b, 0, pad, 0, b.length);
-                b = pad;
+                System.arraycopy(block, 0, pad, 0, origLen);
+                block = pad;
             }
 
-            float p = vad.feed(b);
-            if (p >= thr) {
-                // keep ONLY voiced frames
-                voiced.append(b);
+            float p = vad.feed(block);          // 0..1
+            if (p > thr) {
+                // Append ONLY the unpadded portion (exact python behavior)
+                voiced.append(java.util.Arrays.copyOf(block, origLen));
             }
-            // else: drop non-voiced completely
         }
-
-        short[] allVoiced = voiced.toArray();
-
-        if (allVoiced.length >= want) {
-            // return the LAST 1.0 s
-            short[] y = new short[want];
-            System.arraycopy(allVoiced, allVoiced.length - want, y, 0, want);
-            return y;
-        }
-
-        if (allVoiced.length == 0) {
-            // nothing voiced → zeros
-            return new short[want];
-        }
-
-        // DUPLICATE the voiced sequence to fill to 1.0 s
-        short[] y = new short[want];
-        int off = 0;
-        while (off < want) {
-            int copy = Math.min(allVoiced.length, want - off);
-            System.arraycopy(allVoiced, 0, y, off, copy);
-            off += copy;
-        }
-        return y;
+        return voiced.toArray();
     }
+
 
     /** Optional convenience if RN sends PCM16LE bytes. */
     public short[] extractLast1sVoiced(byte[] pcm16le) {
-        final int want = (int)Math.round(1.0f * cfg.rateHz);
-        if (pcm16le == null) return new short[want];
+        if (pcm16le == null) return new short[0];
         int smp = pcm16le.length / 2;
         short[] x = new short[smp];
         for (int i=0, s=0; i+1<pcm16le.length; i+=2, s++) {
@@ -781,7 +771,7 @@ public final class SpeakerIdApi implements AutoCloseable {
             int hi = (pcm16le[i+1] << 8);
             x[s] = (short)(hi | lo);
         }
-        return extractLast1sVoiced(x);
+        return extractLast1sVoiced(x); // now tail-first, VAD-only, variable length
     }
 
     private static final class ShortArray {
@@ -806,8 +796,8 @@ public final class SpeakerIdApi implements AutoCloseable {
         length = Math.max(0, Math.min(length, pcm.length));
 
         try {
-            short[] oneSec = buildOneSecondWindow(pcm, length);
-            float[] emb = engine.embedOnce(oneSec); // returns L2-normalized
+            short[] voicedTail = extractLast1sVoiced(java.util.Arrays.copyOf(pcm, length));
+            float[] emb = engine.embedOnce(voicedTail);
             // FIFO: keep at most capacity
             if (cm.fifo.size() >= cm.capacity) cm.fifo.removeFirst();
             cm.fifo.addLast(emb);
@@ -867,7 +857,7 @@ public final class SpeakerIdApi implements AutoCloseable {
 
         try {
             length = Math.max(0, Math.min(length, pcm.length));
-            short[] oneSec = buildOneSecondWindow(pcm, length);
+            short[] oneSec = extractLast1sVoiced(java.util.Arrays.copyOf(pcm, length));
             float[] q = engine.embedOnce(oneSec); // L2-normalized
 
             float best = (cm.mean != null) ? SpeakerEmbedderOrt.cosine(q, cm.mean) : Float.NEGATIVE_INFINITY;
@@ -880,29 +870,6 @@ public final class SpeakerIdApi implements AutoCloseable {
             // Spec: do not fail; return worst score if embedding fails for any reason.
             return Float.NEGATIVE_INFINITY;
         }
-    }
-
-    // ------------------------- helpers (local, no impact to engine) -------------------------
-
-    /** Build exactly 1.0 s window: prefer LAST 1.0 s; if shorter, duplicate to fill. */
-    private short[] buildOneSecondWindow(short[] pcm, int length) {
-        int want = secondsToSamps(1.0f);
-        if (length >= want) {
-            int start = length - want;
-            short[] y = new short[want];
-            System.arraycopy(pcm, start, y, 0, want);
-            return y;
-        }
-        // Duplicate (loop) to fill up to 1.0s
-        if (length <= 0) return new short[want];
-        short[] y = new short[want];
-        int i = 0;
-        while (i < want) {
-            int take = Math.min(length, want - i);
-            System.arraycopy(pcm, 0, y, i, take);
-            i += take;
-        }
-        return y;
     }
 
     private void persistExtCluster(ExtCluster cm) throws IOException {
